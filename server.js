@@ -80,7 +80,7 @@ function detectSupportedQemuAccelerators(binary) {
   return ['tcg'];
 }
 
-function detectBestQemuAcceleration(arch = 'x86_64') {
+function detectBestQemuAcceleration(arch = ((process.arch === 'arm64' || process.arch === 'aarch64') ? 'aarch64' : 'x86_64')) {
   if (process.env.QEMU_ACCEL) return process.env.QEMU_ACCEL;
   let binary;
   try { binary = qemuBinaryFor(arch); } catch (_) { return 'tcg'; }
@@ -519,6 +519,8 @@ function imageById(id) {
   const vbox = selectedProfile(catalog, id, 'vbox');
   const active = selectedProfile(catalog, id, sessionEngine);
   return {id, label: active.label, startupDiskEnabled: active.startupDiskEnabled,
+    boot: active.boot || 'disk',
+    containerImage: active.containerImage || null,
     arch: active.arch || 'x86_64',
     images: {raw: qemu.image, vdi: vbox.image},
     virtualbox: {osType: 'Linux_64', networkModel: vbox.networkModel === 'virtio' ? 'virtio' : '82540EM',
@@ -648,7 +650,10 @@ app.get('/api/systems', (_req, res) => {
       const p = selectedProfile(config, id, sessionEngine);
       const rawFile = config.systems[id].qemu.image;
       const vdiFile = config.systems[id].vbox.image;
+      const arch = p.arch || 'x86_64';
       return {id, label: p.label,
+        arch,
+        qemuAcceleration: detectBestQemuAcceleration(arch),
         images: {raw: rawFile, vdi: vdiFile},
         imageExists: {
           raw: !!(rawFile && fs.existsSync(imagePath(rawFile))),
@@ -795,6 +800,7 @@ function validateArchiveSession(snapshot, stage, {discardStaleDisks = false} = {
           !/^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/.test(nic.mac) || macs.has(nic.mac)) throw new Error('Invalid or duplicate MAC address.');
       macs.add(nic.mac);
       if (nic.switchId === null) { if (nic.port !== null) throw new Error('Disconnected Ethernet must have no port.'); }
+      else if (nic.switchId === 'nat') { if (nic.port !== null) throw new Error('Internet (NAT) Ethernet must have no port.'); }
       else {
         if (!switches.has(nic.switchId) || !Number.isInteger(nic.port) || nic.port < 1 || nic.port > 32) throw new Error('Invalid Ethernet switch or port.');
         const key = `${nic.switchId}:${nic.port}`;
@@ -1175,6 +1181,23 @@ function hostConfigurationResponse(session) {
 
 function imagePath(file) { return path.resolve(root, file); }
 
+function qemuEfiFirmware() {
+  const envPath = commands.QEMU_EFI_AARCH64 || process.env.QEMU_EFI_AARCH64;
+  if (envPath && fs.existsSync(envPath)) return envPath;
+  const candidates = [
+    '/opt/homebrew/share/qemu/edk2-aarch64-code.fd',
+    '/usr/local/share/qemu/edk2-aarch64-code.fd',
+    '/usr/share/qemu-efi-aarch64/QEMU_EFI.fd',
+    '/usr/share/AAVMF/AAVMF_CODE.fd',
+    '/usr/share/edk2/aarch64/QEMU_EFI.silent.fd',
+    '/usr/share/edk2/aarch64/QEMU_EFI.fd'
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
 function qemuArgs(session, image, overlay) {
   const settings = session.qemuOptions;
   const extraOptions = [...settings.extraOptions];
@@ -1184,8 +1207,13 @@ function qemuArgs(session, image, overlay) {
       extraOptions[cpuIndex + 1] = 'max';
     }
   }
+  const isAarch64 = image.arch === 'aarch64' || image.arch === 'arm64';
+  const biosArg = (isAarch64 && settings.boot !== 'kernel') ? (() => {
+    const bios = qemuEfiFirmware();
+    return bios ? ['-bios', bios] : [];
+  })() : [];
   const common = [
-    ...extraOptions, '-accel', session.qemuAcceleration,
+    ...extraOptions, ...biosArg, '-accel', session.qemuAcceleration,
     '-display', settings.display, '-m', String(settings.memory), '-smp', String(settings.smp),
     '-rtc', `base=${settings.rtcBase}`, '-monitor', `unix:${session.monitorPath},server=on,wait=off`,
     '-serial', `unix:${session.socketPath},server=on,wait=off`
@@ -1195,7 +1223,7 @@ function qemuArgs(session, image, overlay) {
     const kernelPath = path.resolve(root, settings.kernel);
     const initrdPath = settings.initrd ? path.resolve(root, settings.initrd) : null;
     const containerImg = session.launchSettings?.containerImage || settings.containerImage || 'docker.io/library/alpine:3.20';
-    const serialConsole = (image.arch === 'aarch64' || image.arch === 'arm64') ? 'console=ttyAMA0 console=ttyS0' : 'console=ttyS0';
+    const serialConsole = isAarch64 ? 'console=ttyAMA0 console=ttyS0' : 'console=ttyS0';
     const appendCmd = `${serialConsole} b2c.cache_device=/dev/vda,use=existing|free-space b2c.run="-it ${containerImg}"`;
     args = [
       ...common,
@@ -1207,7 +1235,13 @@ function qemuArgs(session, image, overlay) {
   } else {
     args = [...common, '-drive', `file=${overlay},if=${settings.diskInterface},format=qcow2,media=disk`, '-boot', `order=${settings.bootDisk}`];
   }
-  if (session.guestIsoAttached && session.guestIso) args.push('-drive', `file=${session.guestIso},if=ide,index=2,media=cdrom,readonly=on,format=raw`);
+  if (session.guestIsoAttached && session.guestIso) {
+    if (isAarch64) {
+      args.push('-cdrom', session.guestIso);
+    } else {
+      args.push('-drive', `file=${session.guestIso},if=ide,index=2,media=cdrom,readonly=on,format=raw`);
+    }
+  }
   // The profile's -nic none disables QEMU's implicit user-network NIC.
   for (const [index, nic] of session.networkInterfaces.entries()) {
     if (nic.switchId === null) {
@@ -1504,7 +1538,7 @@ app.get('/api/options/:sessionId', (req, res) => {
     const session = launched ? existing : {
       id, ...sessionPaths(id),
       generation: existing?.generation || 0,
-      engine, qemuAcceleration: engine.startsWith('qemu') ? qemuAcceleration(engine, false) : null,
+      engine, qemuAcceleration: engine.startsWith('qemu') ? qemuAcceleration(engine, image?.arch, false) : null,
       launchSettings: launchSettingsFor(image.id, req.query.settings ? JSON.parse(req.query.settings) : {}),
       qemuOptions: null,
       networkInterfaces: previewInterfaces
@@ -1863,19 +1897,32 @@ async function stop(session, options = {}) {
         }
       }
     } else {
-      try {
-        appendLog(session, '$ QEMU monitor: system_powerdown');
-        await sendMonitorCommand(session, 'system_powerdown');
-        await waitForQemuExit(current, 10000);
-      } catch (error) {
-        if (options.forceOnTimeout === false) throw new Error(`Host did not power off gracefully: ${error.message}`);
-        appendLog(session, `# Graceful QEMU shutdown failed: ${error.message}; sending SIGTERM`);
+      const isKernelBoot = session.selectedImage?.boot === 'kernel' || session.qemuOptions?.boot === 'kernel' || session.selectedImage?.id === 'container';
+      if (isKernelBoot) {
+        appendLog(session, '# Direct kernel boot host without ACPI: terminating QEMU cleanly with SIGTERM');
         current.kill('SIGTERM');
-        try { await waitForQemuExit(current, 2000); }
-        catch (_) {
-          appendLog(session, '$ signal sent to qemu-system-x86_64: SIGKILL');
+        try { await waitForQemuExit(current, 5000); }
+        catch (error) {
+          if (options.forceOnTimeout === false) throw new Error(`Host did not power off gracefully: ${error.message}`);
+          appendLog(session, '# Signal sent to QEMU: SIGKILL');
           current.kill('SIGKILL');
           await waitForQemuExit(current, 5000);
+        }
+      } else {
+        try {
+          appendLog(session, '$ QEMU monitor: system_powerdown');
+          await sendMonitorCommand(session, 'system_powerdown');
+          await waitForQemuExit(current, 10000);
+        } catch (error) {
+          if (options.forceOnTimeout === false) throw new Error(`Host did not power off gracefully: ${error.message}`);
+          appendLog(session, `# Graceful QEMU shutdown failed: ${error.message}; sending SIGTERM`);
+          current.kill('SIGTERM');
+          try { await waitForQemuExit(current, 2000); }
+          catch (_) {
+            appendLog(session, '# Signal sent to QEMU: SIGKILL');
+            current.kill('SIGKILL');
+            await waitForQemuExit(current, 5000);
+          }
         }
       }
     }
@@ -1918,7 +1965,7 @@ async function destroySession(session) {
     }
     fs.rmSync(tempFile(session, 'vbox-vm'), {recursive: true, force: true});
   } else if (current) {
-    appendLog(session, '$ force kill qemu-system-x86_64: SIGKILL');
+    appendLog(session, '# Force kill QEMU: SIGKILL');
     current.kill('SIGKILL');
     try { await waitForQemuExit(current, 5000); } catch (_) {}
   }
